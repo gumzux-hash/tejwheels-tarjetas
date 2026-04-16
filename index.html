@@ -270,8 +270,6 @@ th{background:#111;color:#fff;position:sticky;top:0;z-index:2;font-size:12px;let
   </div>
 </div>
 
-<!-- Tesseract OCR -->
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <!-- Supabase JS v2 -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
@@ -454,53 +452,76 @@ function clrImgs(){
 /* ══════════════════════════════════════
    OCR — CONSERVADOR
 ══════════════════════════════════════ */
-function runOcr(){
+async function runOcr(){
   if(ocrRunning) return;
   if(!imgA && !imgR){ st('Sube al menos una foto primero.','err'); return; }
   ocrRunning=true; ocrBtn.disabled=true;
-  setOcr('Leyendo tarjeta...','loading');
-  st('Procesando OCR...','info');
-  var images=[];
-  if(imgA) images.push(imgA);
-  if(imgR) images.push(imgR);
-  var allText='', processed=0;
-  function processNext(idx){
-    if(idx>=images.length){ finishOcr(allText); return; }
-    Tesseract.recognize(images[idx], ['spa','eng'], {
-      logger: function(m){
-        if(m.status==='recognizing text'){
-          var pct=Math.round((m.progress||0)*100);
-          setOcr('Leyendo imagen '+(idx+1)+'/'+images.length+'... '+pct+'%','loading');
-        }
-      }
-    }).then(function(result){
-      allText += ' ' + result.data.text;
-      processed++;
-      processNext(idx+1);
-    }).catch(function(err){
-      console.error('OCR error:', err);
-      if(processed===0){
-        setOcr('Error al leer la imagen. Rellena manualmente.','err');
-        st('Error OCR.','err');
-        ocrRunning=false; ocrBtn.disabled=false;
-      } else { finishOcr(allText); }
-    });
-  }
-  processNext(0);
-}
+  setOcr('Leyendo tarjeta con IA...','loading');
+  st('Enviando imagen a Claude...','info');
 
-function finishOcr(text){
-  ocrRunning=false; ocrBtn.disabled=false;
-  rawOcrText = trim(text);
-  if(!rawOcrText){
-    setOcr('No se detectó texto. Revisa la calidad de la imagen.','err');
-    st('No se detectó texto.','err'); return;
+  /* Construir content con las imágenes disponibles */
+  var content = [];
+  [imgA, imgR].forEach(function(img){
+    if(!img) return;
+    /* img es data:image/jpeg;base64,XXXX — extraer tipo y datos */
+    var match = img.match(/^data:([^;]+);base64,(.+)$/);
+    if(!match) return;
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: match[1], data: match[2] }
+    });
+  });
+
+  content.push({
+    type: 'text',
+    text: 'Esta es una tarjeta de visita. Extrae todos los datos que veas y devuelve ÚNICAMENTE un objeto JSON válido, sin texto adicional, sin bloques de código, solo el JSON. Usa exactamente estas claves:\n{"nombre":"","apellidos":"","empresa":"","cargo":"","tel":"","movil":"","email":"","web":"","dir":""}\nReglas:\n- nombre: solo el primer nombre\n- apellidos: uno o dos apellidos\n- tel: teléfono fijo (empieza por 9 en España)\n- movil: teléfono móvil (empieza por 6 o 7 en España)\n- Si un campo no aparece en la tarjeta, déjalo vacío ""\n- No inventes datos\n- dir: dirección completa en una sola línea'
+  });
+
+  try {
+    var response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 500,
+        messages: [{ role: 'user', content: content }]
+      })
+    });
+
+    if(!response.ok){
+      throw new Error('HTTP ' + response.status + ' — ' + response.statusText);
+    }
+
+    var data = await response.json();
+    var raw = (data.content && data.content[0] && data.content[0].text) || '';
+    rawOcrText = raw;
+
+    /* Parsear el JSON devuelto por Claude */
+    var parsed = {};
+    try {
+      /* quitar posibles backticks si los hubiera */
+      var clean = raw.replace(/```[a-z]*/gi,'').replace(/```/g,'').trim();
+      parsed = JSON.parse(clean);
+    } catch(e){
+      console.error('JSON parse error:', e, raw);
+      setOcr('Claude respondió pero no pudo parsearse. Rellena manualmente.','err');
+      st('Error al interpretar respuesta.','err');
+      ocrRunning=false; ocrBtn.disabled=false;
+      return;
+    }
+
+    fillForm(parsed);
+    var filled = Object.values(parsed).filter(function(v){ return v && trim(v); }).length;
+    setOcr('✓ '+filled+' campos detectados por IA. Revisa antes de guardar.','ok');
+    st('Datos extraídos. Revisa y corrige si es necesario.','ok');
+
+  } catch(e) {
+    console.error('Claude OCR error:', e);
+    setOcr('Error al contactar con la IA: ' + e.message,'err');
+    st('Error de conexión con la IA.','err');
   }
-  var parsed = parseBusinessCard(rawOcrText);
-  fillForm(parsed);
-  var filled = Object.values(parsed).filter(function(v){ return v && trim(v); }).length;
-  setOcr('Texto extraído. '+filled+' campos detectados. Revisa antes de guardar.','ok');
-  st('Datos extraídos. Revisa y corrige si es necesario.','ok');
+
+  ocrRunning=false; ocrBtn.disabled=false;
 }
 
 /* ══════════════════════════════════════
@@ -511,85 +532,119 @@ function parseBusinessCard(text){
   var result = { nombre:'', apellidos:'', empresa:'', cargo:'', tel:'', movil:'', email:'', web:'', dir:'' };
   var lines = text.split(/[\n\r]+/).map(function(l){ return l.trim(); }).filter(function(l){ return l.length > 1; });
 
-  /* EMAIL — regex fiable */
-  var reEmail = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
-  for(var i=0; i<lines.length; i++){
-    var m = lines[i].match(reEmail);
-    if(m){ result.email = m[0]; break; }
-  }
+  /* EMAIL — regex fiable, buscar en todo el texto */
+  var reEmail = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+  var emailMatches = text.match(reEmail) || [];
+  if(emailMatches.length > 0) result.email = emailMatches[0];
 
-  /* WEB — sólo si tiene dominio reconocible y no es email */
-  var reWeb = /(?:https?:\/\/)?(?:www\.)[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)*/;
-  var reWeb2 = /[a-zA-Z0-9\-]+\.(?:com|es|net|org|io|eu|info|biz|co\.uk|com\.mx|com\.ar)[^\s]*/;
-  for(var i=0; i<lines.length; i++){
-    if(result.email && lines[i].includes(result.email)) continue;
-    var m = lines[i].match(reWeb) || lines[i].match(reWeb2);
-    if(m && !m[0].includes('@')){ result.web = m[0]; break; }
-  }
+  /* WEB — con www o dominio explícito, excluir emails */
+  var reWeb  = /(?:https?:\/\/)?www\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)*/g;
+  var reWeb2 = /[a-zA-Z0-9\-]+\.(?:com|es|net|org|io|eu|info|biz|co\.uk|com\.mx|com\.ar)(?:\/[^\s]*)?/g;
+  var webCandidates = (text.match(reWeb)||[]).concat(text.match(reWeb2)||[]);
+  webCandidates.forEach(function(w){
+    if(!result.web && !w.includes('@') && w !== result.email) result.web = w;
+  });
 
-  /* TELÉFONOS — flexible */
-  var reEs6 = /(?:\+?34[\s\-]?)?[6]\d{8}/g;   /* móvil español */
-  var reEs7 = /(?:\+?34[\s\-]?)?[789]\d{8}/g;   /* fijo o móvil */
-  var reInt  = /\+\d{1,3}[\s\-]?\d{6,12}/g;
-  var mobMatches = (text.match(reEs6)||[]).map(function(t){ return t.replace(/[\s\-]/g,''); });
-  var telMatches = (text.match(reEs7)||[]).map(function(t){ return t.replace(/[\s\-]/g,''); });
-  var intMatches = (text.match(reInt)||[]).map(function(t){ return t.replace(/[\s\-]/g,''); });
-  /* quitar duplicados */
-  var allTels = mobMatches.concat(telMatches).concat(intMatches).filter(function(v,i,a){ return a.indexOf(v)===i; });
-  if(allTels.length>=2){ result.movil=allTels[0]; result.tel=allTels[1]; }
-  else if(allTels.length===1){
-    if(/^[6]/.test(allTels[0].replace(/^\+34/,''))) result.movil=allTels[0];
-    else result.tel=allTels[0];
-  }
+  /* TELÉFONOS — capturar con espacios/puntos (ej: 955 731 440) */
+  var reSpaced = /\b9\d{2}[\s\.\-]?\d{3}[\s\.\-]?\d{3}\b/g;  /* fijo 9xx */
+  var reMobil  = /\b6\d{2}[\s\.\-]?\d{3}[\s\.\-]?\d{3}\b/g;  /* móvil 6xx */
+  var reOther  = /\b[789]\d{2}[\s\.\-]?\d{3}[\s\.\-]?\d{3}\b/g;
+  var reInt    = /\+\d{1,3}[\s\-]?\d{6,14}/g;
+  var cleanT   = function(t){ return t.replace(/[\s\.\-]/g,''); };
+  var mobs  = (text.match(reMobil )||[]).map(cleanT);
+  var fijos = (text.match(reSpaced)||[]).map(cleanT);
+  var otros = (text.match(reOther )||[]).map(cleanT);
+  var ints  = (text.match(reInt   )||[]).map(cleanT);
+  var allTels = mobs.concat(fijos).concat(otros).concat(ints).filter(function(v,i,a){ return a.indexOf(v)===i; });
+  /* asignar: primero móvil (6xx), luego fijo */
+  allTels.forEach(function(t){
+    if(!result.movil && /^(\+34)?6/.test(t)) result.movil = t;
+    else if(!result.tel) result.tel = t;
+  });
 
-  /* Líneas ya usadas */
+  /* Marcar líneas ya usadas */
   var usedIdx = [];
-  lines.forEach(function(line,idx){
-    if(result.email && line.includes(result.email)) usedIdx.push(idx);
-    if(result.web && line.replace(/https?:\/\//,'').includes(result.web.replace(/https?:\/\//,''))) usedIdx.push(idx);
-    allTels.forEach(function(t){ if(line.replace(/[\s\-\(\)\.]/g,'').includes(t.replace(/[\s\-\(\)\.]/g,''))) usedIdx.push(idx); });
+  lines.forEach(function(line, idx){
+    var lclean = line.replace(/[\s\.\-\(\)]/g,'');
+    if(result.email && line.includes(result.email))  usedIdx.push(idx);
+    if(result.web   && line.replace(/https?:\/\//,'').includes(result.web.replace(/https?:\/\//,''))) usedIdx.push(idx);
+    allTels.forEach(function(t){
+      if(lclean.includes(t)) usedIdx.push(idx);
+    });
   });
 
-  /* DIRECCIÓN — solo si contiene indicios claros */
-  var reAddr = /(?:c\/|calle|avda|av\.|avenida|plaza|pl\.|paseo|pol[íi]gono|polígono|pol\.|nº|núm|n[uú]m\.?|cp\s?\d{5}|\b\d{5}\b)/i;
-  lines.forEach(function(line,idx){
-    if(usedIdx.indexOf(idx)>=0 || result.dir) return;
-    if(reAddr.test(line)){ result.dir=line; usedIdx.push(idx); }
+  /* DIRECCIÓN — CP de 5 dígitos, o palabras de calle, o línea con ciudad conocida */
+  var reAddr = /(?:c\/|calle|avda?\.?|avenida|plaza|pz\.?|pl\.|paseo|po\.|pol[íi]gono|pol\.|n[uúº]m|nº|\b\d{5}\b)/i;
+  /* también líneas que contienen un CP seguido de texto (ciudad) */
+  var reCpCiudad = /\b\d{5}\s+[A-Za-zÀ-ÿ]/;
+  lines.forEach(function(line, idx){
+    if(usedIdx.indexOf(idx)>=0) return;
+    if(reAddr.test(line) || reCpCiudad.test(line)){
+      result.dir = result.dir ? result.dir + ', ' + line : line;
+      usedIdx.push(idx);
+    }
   });
 
-  /* CARGO — solo palabras clave conocidas */
-  var reCargo = /\b(?:director[a]?|gerente|manager|ceo|cto|cfo|coo|presidente|vicepresidente|jef[eo]|responsable|coordinador[a]?|comercial|delegad[oa]|agente|representante|técnic[oa]|ingenier[oa]|consultor[a]?|asesor[a]?|account|sales|marketing|socio|partner|founder|administrador[a]?|export|import|compras|logística|ventas)\b/i;
-  lines.forEach(function(line,idx){
+  /* CARGO — palabras clave */
+  var reCargo = /\b(?:director[a]?|gerente|manager|ceo|cto|cfo|coo|presidente|vicepresidente|jef[eo]|responsable|coordinador[a]?|comercial|gestor[a]?|delegad[oa]|agente|representante|técnic[oa]|ingenier[oa]|consultor[a]?|asesor[a]?|account|sales|marketing|socio|partner|founder|administrador[a]?|export|import|compras|logística|ventas|supervisor[a]?|analista)\b/i;
+  lines.forEach(function(line, idx){
     if(usedIdx.indexOf(idx)>=0 || result.cargo) return;
-    if(reCargo.test(line)){ result.cargo=line; usedIdx.push(idx); }
+    if(reCargo.test(line)){ result.cargo = line; usedIdx.push(idx); }
   });
 
-  /* EMPRESA — indicios claros */
-  var reEmp = /\b(?:s\.?[al]\.?u?\.?|s\.?[al]\.?|s\.c\.?|s\.r\.l\.?|corp\.?|ltd\.?|group|solutions|services|industri|tecnolog|wheel|rueda|component|supply|import|export|trading|distribu|manufactur|global|ibérica|iberia)\b/i;
-  lines.forEach(function(line,idx){
+  /* EMPRESA — forma jurídica O línea en mayúsculas largas */
+  var reEmp = /\b(?:s\.?[al]\.?u?\.?|s\.?[al]\.?|s\.c\.?|s\.r\.l\.?|corp\.?|ltd\.?|group|solutions|services|industri|tecnolog|wheel|rueda|component|supply|import|export|trading|distribu|manufactur|global|ibérica|iberia|oficina|banco|seguros|asesores|consultores|abogados|farmacia|clínica|centro)\b/i;
+  lines.forEach(function(line, idx){
     if(usedIdx.indexOf(idx)>=0 || result.empresa) return;
-    if(reEmp.test(line)){ result.empresa=line; usedIdx.push(idx); }
+    /* forma jurídica explícita */
+    if(reEmp.test(line)){ result.empresa = line; usedIdx.push(idx); return; }
+    /* línea en mayúsculas (≥4 chars, sin números, probable nombre empresa) */
+    var noSpaces = line.replace(/\s/g,'');
+    if(noSpaces.length >= 4 && noSpaces === noSpaces.toUpperCase() && /[A-ZÁÉÍÓÚÑ]{3,}/.test(noSpaces)){
+      result.empresa = line; usedIdx.push(idx);
+    }
   });
 
-  /* NOMBRE — primera línea libre con solo palabras (sin números ni símbolos raros) */
-  var freeLines = lines.filter(function(l,i){ return usedIdx.indexOf(i)<0 && l.length>1 && !/^[\d\s.\-+()]+$/.test(l) && !l.includes('@'); });
+  /* NOMBRE — líneas libres de texto legible */
+  /* criterio: sin @, sin solo dígitos, longitud razonable, contiene letras */
+  var isNameLike = function(l){
+    return l.length >= 3 &&
+           l.length <= 60 &&
+           !l.includes('@') &&
+           /[A-Za-zÀ-ÿ]{2,}/.test(l) &&
+           !/^\d/.test(l) &&
+           !/^[T\.\s]*\d/.test(l);   /* evitar "T. 955..." */
+  };
+  var freeLines = lines.filter(function(l,i){ return usedIdx.indexOf(i)<0 && isNameLike(l); });
+
   if(freeLines.length > 0){
     var nameLine = freeLines[0];
-    var parts = nameLine.split(/\s+/).filter(function(p){ return p.length>1 && /^[A-Za-zÀ-ÿ]+$/.test(p); });
-    if(parts.length >= 2){
-      result.nombre = parts[0];
-      result.apellidos = parts.slice(1).join(' ');
-    } else if(nameLine.length <= 40) {
+    /* separar nombre / apellidos por espacios */
+    var parts = nameLine.split(/\s+/).filter(function(p){ return p.length >= 1; });
+    if(parts.length >= 3){
+      /* ej: Miguel Angel Cano Carretero → nombre=Miguel Angel, apellidos=Cano Carretero */
+      /* heurística: si hay 4 palabras, 2+2; si hay 3, 1+2 */
+      var split = parts.length >= 4 ? 2 : 1;
+      result.nombre    = parts.slice(0, split).join(' ');
+      result.apellidos = parts.slice(split).join(' ');
+    } else if(parts.length === 2){
+      result.nombre    = parts[0];
+      result.apellidos = parts[1];
+    } else {
       result.nombre = nameLine;
     }
-    /* si empresa no encontrada, segunda línea libre */
+    usedIdx.push(lines.indexOf(nameLine));
+
+    /* segunda línea libre → empresa si no encontrada */
     if(!result.empresa && freeLines.length > 1){
       result.empresa = freeLines[1];
     }
   }
 
   /* Limpiar */
-  Object.keys(result).forEach(function(k){ result[k] = trim(result[k]).replace(/[|]{1,}/g,'').trim(); });
+  Object.keys(result).forEach(function(k){
+    result[k] = trim(result[k]).replace(/\|+/g,'').replace(/^[,;\s]+|[,;\s]+$/g,'').trim();
+  });
   return result;
 }
 
@@ -823,4 +878,3 @@ boot();
 </script>
 </body>
 </html>
-
